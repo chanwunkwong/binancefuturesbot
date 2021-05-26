@@ -1,6 +1,6 @@
 import websocket, json, pprint, talib, numpy
 import config
-import requests,time, hmac, hashlib
+import requests, time, hmac, hashlib
 from binance.client import Client
 from binance.enums import *
 
@@ -11,7 +11,6 @@ NUMBER_SD = 2
 BB_RANGE_PERCENTILE = 95
 AUM_TARGET_USD = 12800000
 
-
 ## base end point for binance futures trading REST API
 base_url_futures = "https://fapi.binance.com"
 
@@ -19,9 +18,7 @@ base_url_futures = "https://fapi.binance.com"
 SOCKET = "wss://fstream.binance.com/ws/" + TRADE_SYMBOL.lower() + "@kline_1m"
 
 # Create a Client object
-# client = Client(config.API_KEY, config.API_SECRET)
-# info = client.get_account()
-# print(info)
+client = Client(config.API_KEY, config.API_SECRET)
 
 ######################################
 # Functions for placing trade orders #
@@ -65,7 +62,9 @@ def TradeOrder(symbol, side, quantity):
 
 closes = []
 bbRanges = []
+bbRangePercentsRaw = []
 bbRangePercents = []
+bbPercents = []
 
 def on_open(ws):
     print('opened connection')
@@ -75,32 +74,57 @@ def on_close(ws):
 
 def on_message(ws, message):
 
-    global closes, bbRanges, bbRangePercents
+    global closes, bbRanges, bbRangePercentsRaw, bbRangePercents, bbPercents
 
-    # print('received message')
+    # Phase 2: add a function to update the "close" price list from "XRPUSDT_1m.csv"
+    # def updateClose(file_csv_1m):
+        # 1. run "kline_1m_historical.py" again to grab miseed kline_1m data (from existing csv file to current minute)
+        # 2. join both the old and new csv kline_1m files
+        # 3. check the last timestamp in the newly joined csv file, is it match with current time
+        # if timestamp not match, redo 1 to 3
+        # 4. take out the close price column, name it as "closes" for later use
+
+    # Phase 1: add back last 20 mins close price date to list "closes"
+    oldCandles = client.get_historical_klines(TRADE_SYMBOL, Client.KLINE_INTERVAL_1MINUTE, "1 hour ago UTC")
+    
+    if len(closes) == 0:
+        for oldCandle in oldCandles:
+            closes.append(float(oldCandle[4]))
+
     json_message = json.loads(message)
-    # pprint.pprint(json_message)
-
     candle = json_message['k']
-
     is_candle_closed = candle['x']
     close = candle['c']
 
-    if is_candle_closed:
+    if True: # is_candle_closed:
         
         closes.append(float(close))
 
-        if len(closes) >= 3: #ROLLING_PERIODS:
+        if True: #ROLLING_PERIODS:
 
             np_closes = numpy.array(closes)
-            upper, middle, lower = talib.BBANDS(np_closes, timeperiod = min(max(3, len(closes)), ROLLING_PERIODS), nbdevup = NUMBER_SD, nbdevdn = NUMBER_SD, matype = 0)
-            bbRangePercent = (np_closes - middle) / (upper - middle) * 100
-            ## store the 1m data series of bbRange and bbRangePercent
-            bbRanges.append(round(upper[-1] - lower[-1], 4))
-            bbRangePercents.append(round(bbRangePercent[-1], 2))
+            upper, middle, lower = talib.BBANDS(np_closes, timeperiod = ROLLING_PERIODS, nbdevup = NUMBER_SD, nbdevdn = NUMBER_SD, matype = 0)
+            
+            temp = (upper - lower) / np_closes * 100
+            bbRangePercentsRaw = temp.tolist()
+            bbRangePercents = [item for item in bbRangePercentsRaw if item == item]
 
-            print("{} minutue(s) passed. Latest BB range is {} and BB percent is {}.".format(len(closes), bbRanges[-1], bbRangePercents[-1]))
-            print("BB Range percentile is {}".format(numpy.percentile(bbRanges, BB_RANGE_PERCENTILE)))
+            # store the 1m data series of bbRange, bbRangePercent and bbPercent
+            bbRanges.append(round(upper[-1] - lower[-1], 4))
+            bbPercents.append(round((np_closes[-1] - middle[-1]) / (upper[-1] - middle[-1]) * 100, 2))
+
+            data_timestamp = createTimeStamp()
+            p = {'timestamp': data_timestamp}
+            p['signature'] = hashing(param2string(p))
+            result = requests.get(url = base_url_futures + '/fapi/v2/account?' + param2string(p), headers = {'X-MBX-APIKEY': config.API_KEY})
+            # get the balance of USDT in futures account
+            print(result.json()['assets'][1]['walletBalance'])
+
+            print("")
+            print("Current time: {}".format(time.strftime("%a, %d %b %Y %H:%M:%S")))
+            print("Latest bbRange: {}".format(bbRanges[-1]))
+            print("Latest bbPercent: {}%".format(bbPercents[-1]))
+            print("Latest bbRangePercent: {}% / Latest bbRangePercent Percentile: {}%".format(round(bbRangePercents[-1], 4), round(numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE), 4)))
             
             # Trade Logic
             #================
@@ -108,13 +132,13 @@ def on_message(ws, message):
             # 1. 2nd last candle closed below LB
             # 2. last candle closed above LB
             # 3. last candle below MID, i.e. bbRangePecent < 0
-            # 4. last bbRange < 95th percentile
-            # 5. last bbRange >= $0.1
+            # 4. last bbRangePercent < 95th percentile
+            # 5. last bbRange >= $0.01
 
             logicBuy1 = (closes[-2] < lower[-2])
             logicBuy2 = (closes[-1] > lower[-1])
             logicBuy3 = (closes[-1] < middle[-1])
-            logicBuy4 = (bbRanges[-1] <= numpy.percentile(bbRanges, BB_RANGE_PERCENTILE))
+            logicBuy4 = (bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
             logicBuy5 = (bbRanges[-1] >= 0.01)
 
             logicBuy = logicBuy1 & logicBuy2 & logicBuy3 & logicBuy4 & logicBuy5  
@@ -129,17 +153,18 @@ def on_message(ws, message):
             
             if logicBuy:
                 print("BUY!")
+            
             # SHORT logic
             # 1. 2nd last candle closed above UB
             # 2. last candle closed below UB
             # 3. last candle above MID, i.e. bbRangePecent > 0
-            # 4. last bbRange < 95th percentile
-            # 5. last bbRange >= $0.1
+            # 4. last bbRangePercent < 95th percentile
+            # 5. last bbRange >= $0.01
 
             logicSell1 = (closes[-2] > upper[-2])
             logicSell2 = (closes[-1] < upper[-1])
             logicSell3 = (closes[-1] > middle[-1])
-            logicSell4 = (bbRanges[-1] <= numpy.percentile(bbRanges, BB_RANGE_PERCENTILE))
+            logicSell4 = (bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
             logicSell5 = (bbRanges[-1] >= 0.01)
 
             logicSell = logicSell1 & logicSell2 & logicSell3 & logicSell4 & logicSell5  
@@ -185,4 +210,3 @@ ws.run_forever()
             # p = {'timestamp': data_timestamp}
             # p['signature'] = hashing(param2string(p))
             # result = requests.get(url = base_url_futures + '/fapi/v2/balance?' + param2string(p), headers = {'X-MBX-APIKEY': config.API_KEY})
-
