@@ -20,6 +20,19 @@ SOCKET = "wss://fstream.binance.com/ws/" + TRADE_SYMBOL.lower() + "@kline_1m"
 # Create a Client object
 client = Client(config.API_KEY, config.API_SECRET)
 
+####################################
+# Functions for portfolio snapshot #
+####################################
+
+#####################################################################################################
+
+def portfolioSnapshot()
+
+    return
+
+
+#####################################################################################################
+
 ######################################
 # Functions for placing trade orders #
 ######################################
@@ -118,14 +131,32 @@ def on_message(ws, message):
             p['signature'] = hashing(param2string(p))
             result = requests.get(url = base_url_futures + '/fapi/v2/account?' + param2string(p), headers = {'X-MBX-APIKEY': config.API_KEY})
             # get the balance of USDT in futures account
-            print(result.json()['assets'][1]['walletBalance'])
+            #pprint.pprint(result.json()['assets'][1])
+            #pprint.pprint(result.json()['positions'])
 
             print("")
-            print("Current time: {}".format(time.strftime("%a, %d %b %Y %H:%M:%S")))
+            print("{}".format(time.strftime("%a, %d %b %Y %H:%M:%S")))
+            print("")
+            #Show USDT balance
+            print("Portfolio")
+            print("=========")
+            currentBalance = float(result.json()['assets'][1]['marginBalance'])
+            print("Balance (USDT): {} / Geometric Score (GS): {}".format(round(currentBalance, 4), round(numpy.log(float(currentBalance) / AUM_TARGET_USD) / numpy.log(1.1), 2)))
+            print("Current Trade P&L: {}%".format(round(float(result.json()['assets'][1]['unrealizedProfit']) / currentBalance * 100, 2)))
+            # Show XRPUSDT quantity
+            for item in result.json()['positions']:
+                if item['symbol'] == TRADE_SYMBOL:
+                    tradeSymbolQuantity = item['positionAmt']
+            
+            print("Balance ({}): {}".format(TRADE_SYMBOL, tradeSymbolQuantity))
+            print("")
+            print("Bollinger Band")
+            print("==============")
             print("Latest bbRange: {}".format(bbRanges[-1]))
             print("Latest bbPercent: {}%".format(bbPercents[-1]))
             print("Latest bbRangePercent: {}% / Latest bbRangePercent Percentile: {}%".format(round(bbRangePercents[-1], 4), round(numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE), 4)))
-            
+            print("")
+
             # Trade Logic
             #================
             ### LONG logic
