@@ -120,20 +120,24 @@ def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
     logicBuy1 = (closes[-2] < lower[-2])
     logicBuy2 = (closes[-1] > lower[-1])
     logicBuy3 = (closes[-1] < middle[-1])
-
     logicBuy = logicBuy1 & logicBuy2 & logicBuy3 & logicAll  
     
     # SHORT logic
     # 1. 2nd last candle closed above UB
     # 2. last candle closed below UB
     # 3. last candle above MID, i.e. bbRangePecent > 0
-
     logicSell1 = (closes[-2] > upper[-2])
     logicSell2 = (closes[-1] < upper[-1])
     logicSell3 = (closes[-1] > middle[-1])
     logicSell = logicSell1 & logicSell2 & logicSell3 & logicAll
 
-    return logicBuy, logicSell
+    if logicBuy & ~logicSell:
+        direction = "BUY"
+    elif ~logicBuy & logicSell:
+        direction = "SELL"
+    else:
+        direction = "NO SIGNAL"
+    return direction
 
 #####################################################################################################
 
@@ -158,51 +162,62 @@ def param2string(param):
 def hashing(query_string):
     return hmac.new(config.API_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
-def TradeOrder(symbol, side):
+def TradeOrder(direction):
     # auto calculate trade quantity
     dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
     quantityTradeSymbol = float(dict_balance_trade_symbol['positionAmt'])
     balance = float(dict_balance_usdt['availableBalance'])
     leverage = float(dict_balance_trade_symbol['leverage'])
-    if side == "BUY":
+
+    if direction == "BUY":
         tradePrice = float(dict_order_book['askPrice'])
-    elif side == "SELL":
+        stopPriceCutLoss = round(tradePrice * (1 - AUM_PERCENTAGE_CUT_LOSS / leverage), 4)
+        stopPriceStopGain = round(tradePrice * (1 + AUM_PERCENTAGE_STOP_GAIN / leverage), 4)
+        sideCover = "SELL"
+    elif direction == "SELL":
         tradePrice = float(dict_order_book['bidPrice'])
+        stopPriceCutLoss = round(tradePrice * (1 + AUM_PERCENTAGE_CUT_LOSS / leverage), 4)
+        stopPriceStopGain = round(tradePrice * (1 - AUM_PERCENTAGE_STOP_GAIN / leverage), 4)
+        sideCover = "BUY"
+
     # make sure no position yet
     if (quantityTradeSymbol == 0):
         quantity = round(balance * leverage / tradePrice * (1 - ORDER_BUFFER), 1)
+    
+        try:
+            data_timestamp = createTimeStamp()
+            pTrade = {'symbol': TRADE_SYMBOL, 'side': direction, 'type': 'MARKET', 'quantity': quantity, 'timestamp': data_timestamp}
+            pTrade['signature'] = hashing(param2string(pTrade))
+            requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pTrade)
+            #send cut loss limit order
+            data_timestamp = createTimeStamp()
+            pCutLoss = {'symbol': TRADE_SYMBOL, 'side': sideCover, 'type': 'STOP', 'quantity': quantity, 'price': stopPriceCutLoss, 'stopPrice': stopPriceCutLoss, 'timeInForce': "GTC", 'reduceOnly': True, 'timestamp': data_timestamp}
+            pCutLoss['signature'] = hashing(param2string(pCutLoss))
+            requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pCutLoss)
+            #send stop gain limit order
+            data_timestamp = createTimeStamp()
+            pStopGain = {'symbol': TRADE_SYMBOL, 'side': sideCover, 'type': 'TAKE_PROFIT', 'quantity': quantity, 'price': stopPriceStopGain, 'stopPrice': stopPriceStopGain, 'timeInForce': "GTC", 'reduceOnly': True, 'timestamp': data_timestamp}
+            pStopGain['signature'] = hashing(param2string(pStopGain))
+            requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pStopGain)
+            return True
+        except Exception as e:
+            return False
 
-    try:
+def killSingleLeftCoverOrder():
+    dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
+    quantityTradeSymbol = float(dict_balance_trade_symbol['positionAmt'])
+    data_timestamp = createTimeStamp()
+    p = {'symbol': TRADE_SYMBOL, 'timestamp': data_timestamp}
+    p['signature'] = hashing(param2string(p))
+    result = requests.get(url = base_url_futures + '/fapi/v1/openOrders?' + param2string(p), headers = {'X-MBX-APIKEY': config.API_KEY})
+    numOutCoverOrder = len(result.json())
+    # conditions to kill all outstanding orders
+    # except the case (have position & have both 2 cut-loss/stop-gain orders), must kill all orders outstanding
+    if not ((quantityTradeSymbol != 0) & (numOutCoverOrder == 2)):
         data_timestamp = createTimeStamp()
-        pTrade = {'symbol': symbol, 'side': side, 'type': 'MARKET', 'quantity': quantity, 'timestamp': data_timestamp}
-        pTrade['signature'] = hashing(param2string(pTrade))
-        resultTrade = requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pTrade)
-        dict_result_trade = resultTrade.json()
-        # finally, set cutloss and stop gain after traded successfully
-        executedPrice = float(dict_result_trade['avgPrice'])
-        executedQuantity = float(dict_result_trade['executedQty'])
-        
-        if side == "BUY":
-            stopPriceCutLoss = executedPrice * (1 - AUM_PERCENTAGE_CUT_LOSS / leverage)
-            stopPriceStopGain = executedPrice * (1 + AUM_PERCENTAGE_STOP_GAIN / leverage)
-        elif side == "SELL":
-            stopPriceCutLoss = executedPrice * (1 + AUM_PERCENTAGE_CUT_LOSS / leverage)
-            stopPriceStopGain = executedPrice * (1 - AUM_PERCENTAGE_STOP_GAIN / leverage)
-
-        # send cut loss limit order
-        data_timestamp = createTimeStamp()
-        pCutLoss = {'symbol': symbol, 'side': side, 'type': 'STOP', 'quantity': executedQuantity, 'stopPrice': stopPriceCutLoss, 'timestamp': data_timestamp}
-        pCutLoss['signature'] = hashing(param2string(pCutLoss))
-        resultTrade = requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pCutLoss)
-        # send stop gain limit order
-        data_timestamp = createTimeStamp()
-        pStopGain = {'symbol': symbol, 'side': side, 'type': 'TAKE_PROFIT', 'quantity': executedQuantity, 'stopPrice': stopPriceStopGain, 'timestamp': data_timestamp}
-        pStopGain['signature'] = hashing(param2string(pStopGain))
-        resultTrade = requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pStopGain)
-
-        return True
-    except Exception as e:
-        return False
+        pKill = {'symbol': TRADE_SYMBOL, 'timestamp': data_timestamp}
+        pKill['signature'] = hashing(param2string(pKill))
+        requests.delete(url = base_url_futures + '/fapi/v1/allOpenOrders', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pKill)
 
 #####################################################################################################
 
@@ -232,33 +247,27 @@ def on_message(ws, message):
     closes, close, is_candle_closed = fillPreviousPriceToCloses(client, closes, message)
 
     if is_candle_closed:
+        ### always check if there is any single pending order 
+        ### (the unfinished side of the cut-loos or stop-gain cover trade order)
         
+        #killSingleLeftCoverOrder()
+
         closes.append(float(close))
 
-        if True:
+        upper, middle, lower, bbRanges, bbRangePercents, bbPercents = calculateBollingerBandData(closes, ROLLING_PERIODS, NUMBER_SD)
 
-            upper, middle, lower, bbRanges, bbRangePercents, bbPercents = calculateBollingerBandData(closes, ROLLING_PERIODS, NUMBER_SD)
+        GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents)
 
-            GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents)
+        direction = generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
 
-            logicBuy, logicSell = generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
-
-            # in case of error signal
-            if logicBuy & logicSell:
-                print("Error signal!!!")
-            else:
-                if logicBuy:
-                    print("BUY!")
-                    orderDone = TradeOrder(TRADE_SYMBOL, "BUY")
-                    if orderDone:
-                        print("Buy completed!")
-                if logicSell:
-                    print("SELL!")
-                    orderDone = TradeOrder(TRADE_SYMBOL, "SELL")
-                    if orderDone:
-                        print("Sell completed!")
-                if (~logicBuy) & (~logicSell):
-                    print("No signal yet...")
+        if direction == "NO SIGNAL":
+            print("No signal yet...")
+        else:
+            TradeOrder(direction)
+            if direction == "BUY":
+                print("BUY!!!!!!!!!!!!!!!!!!")
+            elif direction == "SELL":
+                print("SELL!!!!!!!!!!!!!!!!!!")
 
 #####################################################################################################
 
