@@ -13,6 +13,7 @@ AUM_TARGET_USD = 12800000
 AUM_PERCENTAGE_STOP_GAIN = 0.125    # expected gain as a % of AUM after a win trade
 AUM_PERCENTAGE_CUT_LOSS = 0.1       # expected gain as a % of AUM after a loss trade
 TRADE_LEVERAGE = 5
+ORDER_BUFFER = 0.005
 
 ## base end point for binance futures trading REST API
 base_url_futures = "https://fapi.binance.com"
@@ -69,7 +70,6 @@ def callAPI():
     return dict_balance_usdt, dict_balance_trade_symbol, dict_order_book
 
 def GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents):
-
     dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
 
     balanceBegin = round(float(dict_balance_usdt['walletBalance']), 2)
@@ -103,53 +103,35 @@ def GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents):
     print("")
 
 def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents):
+    ### ALL logic
+    # 1. last bbRangePercent < 95th percentile
+    # 2. last bbRange >= $0.01
+    # 3. No holding in TRADE_SYMBOL
+    logicAll1 = (bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
+    logicAll2 = (bbRanges[-1] >= 0.01)
+    dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
+    logicAll3 = float(dict_balance_trade_symbol['positionAmt']) == 0
+    logicAll = logicAll1 & logicAll2 & logicAll3
 
     ### LONG logic
     # 1. 2nd last candle closed below LB
     # 2. last candle closed above LB
     # 3. last candle below MID, i.e. bbRangePecent < 0
-    # 4. last bbRangePercent < 95th percentile
-    # 5. last bbRange >= $0.01
-
     logicBuy1 = (closes[-2] < lower[-2])
     logicBuy2 = (closes[-1] > lower[-1])
     logicBuy3 = (closes[-1] < middle[-1])
-    logicBuy4 = (bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
-    logicBuy5 = (bbRanges[-1] >= 0.01)
 
-    logicBuy = logicBuy1 & logicBuy2 & logicBuy3 & logicBuy4 & logicBuy5  
-
-    ### place buy market order
-    # 0. check if current XRP quantity = 0, if yes continue, if no then exit
-    # 1. get current balance
-    # 2. make sure current leverage = 5
-    # 3. trading size = 5x leverage on current balance, calculate XRP quantity to trade, round down to 1 d.p.
-    # 4. set cut loss = market price (trade price) * 98%, round up to 4 d.p.
-    # 5. set stop gain = market price (trade price) * 102.5%, round up to 4 d.p.
-    
+    logicBuy = logicBuy1 & logicBuy2 & logicBuy3 & logicAll  
     
     # SHORT logic
     # 1. 2nd last candle closed above UB
     # 2. last candle closed below UB
     # 3. last candle above MID, i.e. bbRangePecent > 0
-    # 4. last bbRangePercent < 95th percentile
-    # 5. last bbRange >= $0.01
 
     logicSell1 = (closes[-2] > upper[-2])
     logicSell2 = (closes[-1] < upper[-1])
     logicSell3 = (closes[-1] > middle[-1])
-    logicSell4 = (bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
-    logicSell5 = (bbRanges[-1] >= 0.01)
-
-    logicSell = logicSell1 & logicSell2 & logicSell3 & logicSell4 & logicSell5  
-
-    ### place sell market order
-    # 0. check if current XRP quantity = 0, if yes continue, if no then exit
-    # 1. get current balance
-    # 2. make sure current leverage = 5
-    # 3. trading size = 5x leverage on current balance, calculate XRP quantity to trade, round down to 1 d.p.
-    # 4. set cut loss = market price (trade price) * 102%, round down to 4 d.p.
-    # 5. set stop gain = market price (trade price) * 97.5%, round down to 4 d.p.
+    logicSell = logicSell1 & logicSell2 & logicSell3 & logicAll
 
     return logicBuy, logicSell
 
@@ -176,13 +158,48 @@ def param2string(param):
 def hashing(query_string):
     return hmac.new(config.API_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
-def TradeOrder(symbol, side, quantity):
+def TradeOrder(symbol, side):
+    # auto calculate trade quantity
+    dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
+    quantityTradeSymbol = float(dict_balance_trade_symbol['positionAmt'])
+    balance = float(dict_balance_usdt['availableBalance'])
+    leverage = float(dict_balance_trade_symbol['leverage'])
+    if side == "BUY":
+        tradePrice = float(dict_order_book['askPrice'])
+    elif side == "SELL":
+        tradePrice = float(dict_order_book['bidPrice'])
+    # make sure no position yet
+    if (quantityTradeSymbol == 0):
+        quantity = round(balance * leverage / tradePrice * (1 - ORDER_BUFFER), 1)
+
     try:
-        data_type = 'MARKET'
         data_timestamp = createTimeStamp()
-        p = {'symbol': symbol, 'side': side, 'type': data_type, 'quantity': quantity, 'timestamp': data_timestamp}
-        p['signature'] = hashing(param2string(p))
-        requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = p)
+        pTrade = {'symbol': symbol, 'side': side, 'type': 'MARKET', 'quantity': quantity, 'timestamp': data_timestamp}
+        pTrade['signature'] = hashing(param2string(pTrade))
+        resultTrade = requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pTrade)
+        dict_result_trade = resultTrade.json()
+        # finally, set cutloss and stop gain after traded successfully
+        executedPrice = float(dict_result_trade['avgPrice'])
+        executedQuantity = float(dict_result_trade['executedQty'])
+        
+        if side == "BUY":
+            stopPriceCutLoss = executedPrice * (1 - AUM_PERCENTAGE_CUT_LOSS / leverage)
+            stopPriceStopGain = executedPrice * (1 + AUM_PERCENTAGE_STOP_GAIN / leverage)
+        elif side == "SELL":
+            stopPriceCutLoss = executedPrice * (1 + AUM_PERCENTAGE_CUT_LOSS / leverage)
+            stopPriceStopGain = executedPrice * (1 - AUM_PERCENTAGE_STOP_GAIN / leverage)
+
+        # send cut loss limit order
+        data_timestamp = createTimeStamp()
+        pCutLoss = {'symbol': symbol, 'side': side, 'type': 'STOP', 'quantity': executedQuantity, 'stopPrice': stopPriceCutLoss, 'timestamp': data_timestamp}
+        pCutLoss['signature'] = hashing(param2string(pCutLoss))
+        resultTrade = requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pCutLoss)
+        # send stop gain limit order
+        data_timestamp = createTimeStamp()
+        pStopGain = {'symbol': symbol, 'side': side, 'type': 'TAKE_PROFIT', 'quantity': executedQuantity, 'stopPrice': stopPriceStopGain, 'timestamp': data_timestamp}
+        pStopGain['signature'] = hashing(param2string(pStopGain))
+        resultTrade = requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pStopGain)
+
         return True
     except Exception as e:
         return False
@@ -214,7 +231,7 @@ def on_message(ws, message):
     # fill back the values of close price into list "closes"
     closes, close, is_candle_closed = fillPreviousPriceToCloses(client, closes, message)
 
-    if True: #is_candle_closed:
+    if is_candle_closed:
         
         closes.append(float(close))
 
@@ -226,32 +243,22 @@ def on_message(ws, message):
 
             logicBuy, logicSell = generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
 
-            if logicBuy:
-                print("BUY!")
-
-            if logicSell:
-                print("SELL!")
-
-            if (~logicBuy) & (~logicSell):
-                print("No signal yet...")
-
-            # if last_rsi > RSI_OVERBOUGHT:
-            #     if  in_position:
-            #         print("Overbought! Sell!")
-            #         order_succeeded = order(TRADE_SYMBOL, TRADE_QUANTITY, SIDE_SELL)
-            #         if order_succeeded:
-            #             in_position = False
-            #     else:
-            #         print("It is overbought, but we don't have any. Nothing to do.")
-
-        #     if last_rsi < RSI_OVERSOLD:
-        #         if not in_position:
-        #             print("Oversold! Buy!")
-        #             order_succeeded = order(TRADE_SYMBOL, TRADE_QUANTITY, SIDE_BUY)
-        #             if order_succeeded:
-        #                 in_position = True
-        #         else:
-        #             print("It is oversold, but we already own it. Nothing to do.")
+            # in case of error signal
+            if logicBuy & logicSell:
+                print("Error signal!!!")
+            else:
+                if logicBuy:
+                    print("BUY!")
+                    orderDone = TradeOrder(TRADE_SYMBOL, "BUY")
+                    if orderDone:
+                        print("Buy completed!")
+                if logicSell:
+                    print("SELL!")
+                    orderDone = TradeOrder(TRADE_SYMBOL, "SELL")
+                    if orderDone:
+                        print("Sell completed!")
+                if (~logicBuy) & (~logicSell):
+                    print("No signal yet...")
 
 #####################################################################################################
 
