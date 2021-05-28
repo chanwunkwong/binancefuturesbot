@@ -1,7 +1,4 @@
-import websocket, json, pprint, talib, numpy
-import config
-import requests, time, hmac, hashlib
-from binance.client import Client
+import config, hashlib, hmac, json, numpy, requests, talib, time, websocket
 from binance.enums import *
 
 ## Constants
@@ -15,14 +12,61 @@ AUM_PERCENTAGE_CUT_LOSS = 0.1       # expected gain as a % of AUM after a loss t
 TRADE_LEVERAGE = 5
 ORDER_BUFFER = 0.005
 
-## base end point for binance futures trading REST API
-base_url_futures = "https://fapi.binance.com"
-
 ## Connect to websocket to get real time futures price streaming
 SOCKET = "wss://fstream.binance.com/ws/" + TRADE_SYMBOL.lower() + "@kline_1m"
 
-# Create a Client object
-client = Client(config.API_KEY, config.API_SECRET)
+class CallAPI:
+    def __init__(self):
+        self.symbol = TRADE_SYMBOL
+        self.timestamp = int(time.time() * 1000)
+        self.__key = config.API_KEY
+        self.__secret = config.API_SECRET
+        self.__base_url_futures = "https://fapi.binance.com"
+    def __param2string(self, param):
+        s = ""
+        for k in param.keys():
+            s += k + "=" + str(param[k]) + "&"
+        return s[:-1]
+    def __hashing(self, query_string):
+        return hmac.new(self.__secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    ############################################################################################################
+    def ACCOUNT_INFO(self):
+        p = {'timestamp': self.timestamp}
+        p['signature'] = self.__hashing(self.__param2string(p))
+        return requests.get(url = self.__base_url_futures + '/fapi/v2/account?' + self.__param2string(p), headers = {'X-MBX-APIKEY': self.__key})
+    def BOOK_TICKER(self):
+        p = {'symbol': self.symbol, 'timestamp': self.timestamp}
+        p['signature'] = self.__hashing(self.__param2string(p))
+        return requests.get(url = self.__base_url_futures + '/fapi/v1/ticker/bookTicker?' + self.__param2string(p), headers = {'X-MBX-APIKEY': self.__key})
+    def dict_balance_usdt(self):
+        return self.ACCOUNT_INFO().json()['assets'][1]
+    def dict_balance_trade_symbol(self):
+        for item in self.ACCOUNT_INFO().json()['positions']:
+            if item['symbol'] == self.symbol:
+                return item
+    def dict_order_book(self):
+        return self.BOOK_TICKER().json()
+    ############################################################################################################
+    def tradeOpen(self, direction, quantity):
+        p = {'symbol': self.symbol, 'side': direction, 'type': 'MARKET', 'quantity': quantity, 'timestamp': self.timestamp}
+        p['signature'] = self.__hashing(self.__param2string(p))
+        requests.post(url = self.__base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': self.__key}, data = p)
+    def tradeClose(self, direction, price, quantity, type):
+        p = {'symbol': self.symbol, 'side': direction, 'type': type, 'quantity': quantity, 'price': price, 'stopPrice': price, 'timeInForce': "GTC", 'reduceOnly': True, 'timestamp': self.timestamp}
+        p['signature'] = self.__hashing(self.__param2string(p))
+        requests.post(url = self.__base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': self.__key}, data = p)
+    ############################################################################################################
+    def GET_OPEN_ORDER(self):
+        p = {'symbol': self.symbol, 'timestamp': self.timestamp}
+        p['signature'] = self.__hashing(self.__param2string(p))
+        return requests.get(url = self.__base_url_futures + '/fapi/v1/openOrders?' + self.__param2string(p), headers = {'X-MBX-APIKEY': self.__key})
+    def KILL_ALL_ORDER(self):
+        p = {'symbol': self.symbol, 'timestamp': self.timestamp}
+        p['signature'] = self.__hashing(self.__param2string(p))
+        requests.delete(url = self.__base_url_futures + '/fapi/v1/allOpenOrders', headers = {'X-MBX-APIKEY': self.__key}, data = p)
+
+# initiate a CallAPI object class
+callAPI = CallAPI()
 
 ###############################
 # Functions within on_message #
@@ -48,33 +92,14 @@ def calculateBollingerBandData(closes, rolling_periods, number_sd):
     bbPercents.append(round((np_closes[-1] - middle[-1]) / (upper[-1] - middle[-1]) * 100, 2)) 
     return upper, middle, lower, bbRanges, bbRangePercents, bbPercents
 
-def callAPI():
-    data_timestamp = createTimeStamp()
-    pResultAccount = {'timestamp': data_timestamp}
-    pResultAccount['signature'] = hashing(param2string(pResultAccount))
-    resultAccount = requests.get(url = base_url_futures + '/fapi/v2/account?' + param2string(pResultAccount), headers = {'X-MBX-APIKEY': config.API_KEY})
-    pResultBookTicker = {'symbol': TRADE_SYMBOL, 'timestamp': data_timestamp}
-    pResultBookTicker['signature'] = hashing(param2string(pResultBookTicker))
-    resultBookTicker = requests.get(url = base_url_futures + '/fapi/v1/ticker/bookTicker?' + param2string(pResultBookTicker), headers = {'X-MBX-APIKEY': config.API_KEY})
-    
-    dict_balance_usdt = resultAccount.json()['assets'][1]
-    for item in resultAccount.json()['positions']:
-        if item['symbol'] == TRADE_SYMBOL:
-            dict_balance_trade_symbol = item
-    dict_order_book = resultBookTicker.json()
-    
-    return dict_balance_usdt, dict_balance_trade_symbol, dict_order_book
-
 def GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents):
-    dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
-
-    balanceBegin = round(float(dict_balance_usdt['walletBalance']), 2)
-    balanceEnd = round(float(dict_balance_usdt['marginBalance']), 2)
-    currentPNL = round(float(dict_balance_usdt['unrealizedProfit']), 2)
+    balanceBegin = round(float(callAPI.dict_balance_usdt()['walletBalance']), 2)
+    balanceEnd = round(float(callAPI.dict_balance_usdt()['marginBalance']), 2)
+    currentPNL = round(float(callAPI.dict_balance_usdt()['unrealizedProfit']), 2)
     gsScore = round(numpy.log(balanceEnd / AUM_TARGET_USD) / numpy.log(1.1), 2)
-    quantityTradeSymbol = float(dict_balance_trade_symbol['positionAmt'])
-    priceEntry = float(dict_balance_trade_symbol['entryPrice'])
-    leverage = float(dict_balance_trade_symbol['leverage'])
+    quantityTradeSymbol = float(callAPI.dict_balance_trade_symbol()['positionAmt'])
+    priceEntry = float(callAPI.dict_balance_trade_symbol()['entryPrice'])
+    leverage = float(callAPI.dict_balance_trade_symbol()['leverage'])
 
     print("")
     print("{}".format(time.strftime("%a, %d %b %Y %H:%M:%S")))
@@ -105,8 +130,7 @@ def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
     # 3. No holding in TRADE_SYMBOL
     logicAll1 = True #(bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
     logicAll2 = (bbRanges[-1] >= 0.01)
-    dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
-    logicAll3 = float(dict_balance_trade_symbol['positionAmt']) == 0
+    logicAll3 = float(callAPI.dict_balance_trade_symbol()['positionAmt']) == 0
     logicAll = logicAll1 & logicAll2 & logicAll3
 
     ### LONG logic
@@ -134,7 +158,6 @@ def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
     else:
         direction = "NO SIGNAL"
     return direction
-
 #####################################################################################################
 
 ######################################
@@ -142,36 +165,20 @@ def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
 ######################################
 
 #####################################################################################################
-
-def createTimeStamp():
-    return int(time.time() * 1000)
-
-def param2string(param):
-    s = ""
-    for k in param.keys():
-        s += k
-        s += "="
-        s += str(param[k])
-        s += "&"
-    return s[:-1]
-
-def hashing(query_string):
-    return hmac.new(config.API_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
-
 def TradeOrder(direction):
     # auto calculate trade quantity
-    dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
-    quantityTradeSymbol = float(dict_balance_trade_symbol['positionAmt'])
-    balance = float(dict_balance_usdt['availableBalance'])
-    leverage = float(dict_balance_trade_symbol['leverage'])
+    #dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
+    quantityTradeSymbol = float(callAPI.dict_balance_trade_symbol()['positionAmt'])
+    balance = float(callAPI.dict_balance_usdt()['availableBalance'])
+    leverage = float(callAPI.dict_balance_trade_symbol()['leverage'])
 
     if direction == "BUY":
-        tradePrice = float(dict_order_book['askPrice'])
+        tradePrice = float(callAPI.dict_order_book()['askPrice'])
         stopPriceCutLoss = round(tradePrice * (1 - AUM_PERCENTAGE_CUT_LOSS / leverage), 4)
         stopPriceStopGain = round(tradePrice * (1 + AUM_PERCENTAGE_STOP_GAIN / leverage), 4)
         sideCover = "SELL"
     elif direction == "SELL":
-        tradePrice = float(dict_order_book['bidPrice'])
+        tradePrice = float(callAPI.dict_order_book()['bidPrice'])
         stopPriceCutLoss = round(tradePrice * (1 + AUM_PERCENTAGE_CUT_LOSS / leverage), 4)
         stopPriceStopGain = round(tradePrice * (1 - AUM_PERCENTAGE_STOP_GAIN / leverage), 4)
         sideCover = "BUY"
@@ -181,40 +188,22 @@ def TradeOrder(direction):
         quantity = round(balance * leverage / tradePrice * (1 - ORDER_BUFFER), 1)
     
         try:
-            data_timestamp = createTimeStamp()
-            pTrade = {'symbol': TRADE_SYMBOL, 'side': direction, 'type': 'MARKET', 'quantity': quantity, 'timestamp': data_timestamp}
-            pTrade['signature'] = hashing(param2string(pTrade))
-            requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pTrade)
-            #send cut loss limit order
-            data_timestamp = createTimeStamp()
-            pCutLoss = {'symbol': TRADE_SYMBOL, 'side': sideCover, 'type': 'STOP', 'quantity': quantity, 'price': stopPriceCutLoss, 'stopPrice': stopPriceCutLoss, 'timeInForce': "GTC", 'reduceOnly': True, 'timestamp': data_timestamp}
-            pCutLoss['signature'] = hashing(param2string(pCutLoss))
-            requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pCutLoss)
-            #send stop gain limit order
-            data_timestamp = createTimeStamp()
-            pStopGain = {'symbol': TRADE_SYMBOL, 'side': sideCover, 'type': 'TAKE_PROFIT', 'quantity': quantity, 'price': stopPriceStopGain, 'stopPrice': stopPriceStopGain, 'timeInForce': "GTC", 'reduceOnly': True, 'timestamp': data_timestamp}
-            pStopGain['signature'] = hashing(param2string(pStopGain))
-            requests.post(url = base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pStopGain)
+            callAPI.tradeOpen(direction, quantity)
+            #place cut loss limit order
+            callAPI.tradeClose(sideCover, stopPriceCutLoss, quantity, "STOP")
+            #place stop gain limit order
+            callAPI.tradeClose(sideCover, stopPriceCutLoss, quantity, "TAKE_PROFIT")
             return True
         except Exception as e:
             return False
 
 def killSingleLeftCoverOrder():
-    dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
-    quantityTradeSymbol = float(dict_balance_trade_symbol['positionAmt'])
-    data_timestamp = createTimeStamp()
-    p = {'symbol': TRADE_SYMBOL, 'timestamp': data_timestamp}
-    p['signature'] = hashing(param2string(p))
-    result = requests.get(url = base_url_futures + '/fapi/v1/openOrders?' + param2string(p), headers = {'X-MBX-APIKEY': config.API_KEY})
-    numOutCoverOrder = len(result.json())
+    quantityTradeSymbol = float(callAPI.dict_balance_trade_symbol()['positionAmt'])
+    openOrder = len(callAPI.GET_OPEN_ORDER().json())
     # conditions to kill all outstanding orders
     # except the case (have position & have both 2 cut-loss/stop-gain orders), must kill all orders outstanding
-    if not ((quantityTradeSymbol != 0) & (numOutCoverOrder == 2)):
-        data_timestamp = createTimeStamp()
-        pKill = {'symbol': TRADE_SYMBOL, 'timestamp': data_timestamp}
-        pKill['signature'] = hashing(param2string(pKill))
-        requests.delete(url = base_url_futures + '/fapi/v1/allOpenOrders', headers = {'X-MBX-APIKEY': config.API_KEY}, data = pKill)
-
+    if not ((quantityTradeSymbol != 0) & (openOrder == 2)):
+        callAPI.KILL_ALL_ORDER()
 #####################################################################################################
 
 ###########################
