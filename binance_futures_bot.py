@@ -30,20 +30,16 @@ client = Client(config.API_KEY, config.API_SECRET)
 
 #####################################################################################################
 
-def fillPreviousPriceToCloses(client, closes, message):
-    oldCandles = client.get_historical_klines(TRADE_SYMBOL, Client.KLINE_INTERVAL_1MINUTE, "1 hour ago UTC")
-    if len(closes) == 0:
-        for oldCandle in oldCandles:
-            closes.append(float(oldCandle[4]))
+def getClose(message):
     json_message = json.loads(message)
     candle = json_message['k']
     is_candle_closed = candle['x']
     close = candle['c']
-    return closes, close, is_candle_closed
+    return close, is_candle_closed
 
 def calculateBollingerBandData(closes, rolling_periods, number_sd):
     np_closes = numpy.array(closes)
-    upper, middle, lower = talib.BBANDS(np_closes, timeperiod = rolling_periods, nbdevup = number_sd, nbdevdn = number_sd, matype = 0)
+    upper, middle, lower = talib.BBANDS(np_closes, timeperiod = min(max(3, len(closes)), rolling_periods), nbdevup = number_sd, nbdevdn = number_sd, matype = 0)
     # store the 1m data series of bbRange, bbRangePercent and bbPercent
     bbRanges.append(round(upper[-1] - lower[-1], 4))           
     temp = (upper - lower) / np_closes * 100
@@ -107,7 +103,7 @@ def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
     # 1. last bbRangePercent < 95th percentile
     # 2. last bbRange >= $0.01
     # 3. No holding in TRADE_SYMBOL
-    logicAll1 = (bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
+    logicAll1 = True #(bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
     logicAll2 = (bbRanges[-1] >= 0.01)
     dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
     logicAll3 = float(dict_balance_trade_symbol['positionAmt']) == 0
@@ -243,19 +239,17 @@ def on_message(ws, message):
 
     global closes, bbRanges, bbRangePercentsRaw, bbRangePercents, bbPercents
 
-    # fill back the values of close price into list "closes"
-    closes, close, is_candle_closed = fillPreviousPriceToCloses(client, closes, message)
+    close, is_candle_closed = getClose(message)
 
     if is_candle_closed:
         ### always check if there is any single pending order 
         ### (the unfinished side of the cut-loos or stop-gain cover trade order)
-        
-        #killSingleLeftCoverOrder()
+        killSingleLeftCoverOrder()
 
         closes.append(float(close))
-
+        
         upper, middle, lower, bbRanges, bbRangePercents, bbPercents = calculateBollingerBandData(closes, ROLLING_PERIODS, NUMBER_SD)
-
+        
         GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents)
 
         direction = generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
