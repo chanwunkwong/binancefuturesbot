@@ -1,4 +1,5 @@
 import config, hashlib, hmac, json, numpy, requests, talib, time, websocket
+from binance.client import Client
 from binance.enums import *
 
 ## Constants
@@ -10,10 +11,11 @@ AUM_TARGET_USD = 12800000
 AUM_PERCENTAGE_STOP_GAIN = 0.125    # expected gain as a % of AUM after a win trade
 AUM_PERCENTAGE_CUT_LOSS = 0.1       # expected gain as a % of AUM after a loss trade
 TRADE_LEVERAGE = 5
-ORDER_BUFFER = 0.005
+ORDER_BUFFER = 0.01
 
 ## Connect to websocket to get real time futures price streaming
 SOCKET = "wss://fstream.binance.com/ws/" + TRADE_SYMBOL.lower() + "@kline_1m"
+client = Client(config.API_KEY, config.API_SECRET)
 
 class CallAPI:
     def __init__(self):
@@ -29,50 +31,44 @@ class CallAPI:
         return s[:-1]
     def __hashing(self, query_string):
         return hmac.new(self.__secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
-    ############################################################################################################
     def ACCOUNT_INFO(self):
-        p = {'timestamp': self.timestamp}
+        p = {'recvWindow': 50000, 'timestamp': self.timestamp}
         p['signature'] = self.__hashing(self.__param2string(p))
-        return requests.get(url = self.__base_url_futures + '/fapi/v2/account?' + self.__param2string(p), headers = {'X-MBX-APIKEY': self.__key})
+        response = requests.get(url = self.__base_url_futures + '/fapi/v2/account?' + self.__param2string(p), headers = {'X-MBX-APIKEY': self.__key})
+        return response.json()
     def BOOK_TICKER(self):
-        p = {'symbol': self.symbol, 'timestamp': self.timestamp}
+        p = {'recvWindow': 50000, 'symbol': self.symbol, 'timestamp': self.timestamp}
         p['signature'] = self.__hashing(self.__param2string(p))
-        return requests.get(url = self.__base_url_futures + '/fapi/v1/ticker/bookTicker?' + self.__param2string(p), headers = {'X-MBX-APIKEY': self.__key})
+        response = requests.get(url = self.__base_url_futures + '/fapi/v1/ticker/bookTicker?' + self.__param2string(p), headers = {'X-MBX-APIKEY': self.__key})
+        return response.json()
     def dict_balance_usdt(self):
-        return self.ACCOUNT_INFO().json()['assets'][1]
+        return self.ACCOUNT_INFO()['assets'][1]
     def dict_balance_trade_symbol(self):
-        for item in self.ACCOUNT_INFO().json()['positions']:
+        for item in self.ACCOUNT_INFO()['positions']:
             if item['symbol'] == self.symbol:
                 return item
     def dict_order_book(self):
-        return self.BOOK_TICKER().json()
-    ############################################################################################################
+        return self.BOOK_TICKER()
+   ############################################################################################################
     def tradeOpen(self, direction, quantity):
-        p = {'symbol': self.symbol, 'side': direction, 'type': 'MARKET', 'quantity': quantity, 'timestamp': self.timestamp}
+        p = {'recvWindow': 50000, 'symbol': self.symbol, 'side': direction, 'type': 'MARKET', 'quantity': quantity, 'timestamp': self.timestamp}
         p['signature'] = self.__hashing(self.__param2string(p))
-        requests.post(url = self.__base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': self.__key}, data = p)
+        response = requests.post(url = self.__base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': self.__key}, data = p)
+        return (response.status_code == 200)
     def tradeClose(self, direction, price, quantity, type):
-        p = {'symbol': self.symbol, 'side': direction, 'type': type, 'quantity': quantity, 'price': price, 'stopPrice': price, 'timeInForce': "GTC", 'reduceOnly': True, 'timestamp': self.timestamp}
+        p = {'recvWindow': 50000, 'symbol': self.symbol, 'side': direction, 'type': type, 'quantity': quantity, 'price': price, 'stopPrice': price, 'timeInForce': "GTC", 'reduceOnly': True, 'timestamp': self.timestamp}
         p['signature'] = self.__hashing(self.__param2string(p))
-        requests.post(url = self.__base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': self.__key}, data = p)
+        response = requests.post(url = self.__base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': self.__key}, data = p)
+        return (response.status_code == 200)
     ############################################################################################################
-    def GET_OPEN_ORDER(self):
-        p = {'symbol': self.symbol, 'timestamp': self.timestamp}
+    def getOpenOrder(self):
+        p = {'recvWindow': 50000, 'symbol': self.symbol, 'timestamp': self.timestamp}
         p['signature'] = self.__hashing(self.__param2string(p))
         return requests.get(url = self.__base_url_futures + '/fapi/v1/openOrders?' + self.__param2string(p), headers = {'X-MBX-APIKEY': self.__key})
-    def KILL_ALL_ORDER(self):
-        p = {'symbol': self.symbol, 'timestamp': self.timestamp}
+    def killAllOrder(self):
+        p = {'recvWindow': 50000, 'symbol': self.symbol, 'timestamp': self.timestamp}
         p['signature'] = self.__hashing(self.__param2string(p))
         requests.delete(url = self.__base_url_futures + '/fapi/v1/allOpenOrders', headers = {'X-MBX-APIKEY': self.__key}, data = p)
-
-# initiate a CallAPI object class
-callAPI = CallAPI()
-
-###############################
-# Functions within on_message #
-###############################
-
-#####################################################################################################
 
 def getClose(message):
     json_message = json.loads(message)
@@ -93,6 +89,7 @@ def calculateBollingerBandData(closes, rolling_periods, number_sd):
     return upper, middle, lower, bbRanges, bbRangePercents, bbPercents
 
 def GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents):
+    callAPI = CallAPI()
     balanceBegin = round(float(callAPI.dict_balance_usdt()['walletBalance']), 2)
     balanceEnd = round(float(callAPI.dict_balance_usdt()['marginBalance']), 2)
     currentPNL = round(float(callAPI.dict_balance_usdt()['unrealizedProfit']), 2)
@@ -106,24 +103,16 @@ def GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents):
     print("")
     print("Portfolio Snaphot")
     print("=================")
-    print("Balance")
-    print("Begin (USDT): {}".format(balanceBegin))
-    print("End (USDT): {}".format(balanceEnd))
-    print("P&L (USDT): {} ({}%)".format(currentPNL, round(currentPNL / balanceBegin * 100, 2)))
+    print("Begin (USDT): {} / End (USDT): {} / P&L (USDT): {} ({}%)".format(balanceBegin, balanceEnd, currentPNL, round(currentPNL / balanceBegin * 100, 2)))
     print("Geometric Score (GS): {}".format(gsScore))
     print("")
-    print("Balance ({}): {}".format(TRADE_SYMBOL, quantityTradeSymbol))
-    print("Entry Price (USDT): {}".format(priceEntry))
-    print("Leverage: {}".format(leverage))
+    print("Balance ({}): {} / Entry Price (USDT): {} / Leverage: {}".format(TRADE_SYMBOL, quantityTradeSymbol, priceEntry, leverage))
     print("")
-    print("Bollinger Band")
-    print("==============")
-    print("bbRange: {}".format(bbRanges[-1]))
-    print("bbPercent: {}%".format(bbPercents[-1]))
-    print("bbRangePercent: {}% / bbRangePercent Percentile: {}%".format(round(bbRangePercents[-1], 4), round(numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE), 4)))
+    print("bbRange: {} / bbPercent: {}% / bbRangePercent: {}% / bbRangePercent Percentile: {}%".format(bbRanges[-1], bbPercents[-1], round(bbRangePercents[-1], 4), round(numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE), 4)))
     print("")
 
 def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents):
+    callAPI = CallAPI()
     ### ALL logic
     # 1. last bbRangePercent < 95th percentile
     # 2. last bbRange >= $0.01
@@ -158,101 +147,84 @@ def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
     else:
         direction = "NO SIGNAL"
     return direction
-#####################################################################################################
 
-######################################
-# Functions for placing trade orders #
-######################################
-
-#####################################################################################################
-def TradeOrder(direction):
+def TradeOrder(sideOpen):
+    callAPI = CallAPI()
     # auto calculate trade quantity
-    #dict_balance_usdt, dict_balance_trade_symbol, dict_order_book = callAPI()
     quantityTradeSymbol = float(callAPI.dict_balance_trade_symbol()['positionAmt'])
     balance = float(callAPI.dict_balance_usdt()['availableBalance'])
     leverage = float(callAPI.dict_balance_trade_symbol()['leverage'])
-
-    if direction == "BUY":
+    print(sideOpen, quantityTradeSymbol, balance, leverage)
+    if sideOpen == "BUY":
         tradePrice = float(callAPI.dict_order_book()['askPrice'])
         stopPriceCutLoss = round(tradePrice * (1 - AUM_PERCENTAGE_CUT_LOSS / leverage), 4)
         stopPriceStopGain = round(tradePrice * (1 + AUM_PERCENTAGE_STOP_GAIN / leverage), 4)
-        sideCover = "SELL"
-    elif direction == "SELL":
+        sideClose = "SELL"
+    elif sideOpen == "SELL":
         tradePrice = float(callAPI.dict_order_book()['bidPrice'])
         stopPriceCutLoss = round(tradePrice * (1 + AUM_PERCENTAGE_CUT_LOSS / leverage), 4)
         stopPriceStopGain = round(tradePrice * (1 - AUM_PERCENTAGE_STOP_GAIN / leverage), 4)
-        sideCover = "BUY"
+        sideClose = "BUY"
 
-    # make sure no position yet
+    # make sure no orders outstanding
+    openOrder = len(callAPI.getOpenOrder().json())
+    while (quantityTradeSymbol == 0) & (openOrder > 0):
+        callAPI.killAllOrder()
     if (quantityTradeSymbol == 0):
         quantity = round(balance * leverage / tradePrice * (1 - ORDER_BUFFER), 1)
-    
-        try:
-            callAPI.tradeOpen(direction, quantity)
-            #place cut loss limit order
-            callAPI.tradeClose(sideCover, stopPriceCutLoss, quantity, "STOP")
-            #place stop gain limit order
-            callAPI.tradeClose(sideCover, stopPriceCutLoss, quantity, "TAKE_PROFIT")
-            return True
-        except Exception as e:
-            return False
-
-def killSingleLeftCoverOrder():
-    quantityTradeSymbol = float(callAPI.dict_balance_trade_symbol()['positionAmt'])
-    openOrder = len(callAPI.GET_OPEN_ORDER().json())
-    # conditions to kill all outstanding orders
-    # except the case (have position & have both 2 cut-loss/stop-gain orders), must kill all orders outstanding
-    if not ((quantityTradeSymbol != 0) & (openOrder == 2)):
-        callAPI.KILL_ALL_ORDER()
-#####################################################################################################
-
-###########################
-# Functions for websocket #
-###########################
-
-#####################################################################################################
-
-closes = []
-bbRanges = []
-bbRangePercentsRaw = []
-bbRangePercents = []
-bbPercents = []
-
-def on_open(ws):
-    print('opened connection')
-
-def on_close(ws):
-    print('closed connection')
-
-def on_message(ws, message):
-
-    global closes, bbRanges, bbRangePercentsRaw, bbRangePercents, bbPercents
-
-    close, is_candle_closed = getClose(message)
-
-    if is_candle_closed:
-        ### always check if there is any single pending order 
-        ### (the unfinished side of the cut-loos or stop-gain cover trade order)
-        killSingleLeftCoverOrder()
-
-        closes.append(float(close))
-        
-        upper, middle, lower, bbRanges, bbRangePercents, bbPercents = calculateBollingerBandData(closes, ROLLING_PERIODS, NUMBER_SD)
-        
-        GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents)
-
-        direction = generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
-
-        if direction == "NO SIGNAL":
-            print("No signal yet...")
+        tradeOpenOK = callAPI.tradeOpen(sideOpen, quantity)
+        if tradeOpenOK:
+            tradeMessage = "{} order is placed! Quantity: {} Cost: {}".format(sideOpen, quantity, tradePrice)
+            tradeCloseCutLossOK = callAPI.tradeClose(sideClose, stopPriceCutLoss, quantity, "STOP")
+            if tradeCloseCutLossOK:
+                print("Cut Loss placed at {}".format(stopPriceCutLoss))
+            tradeCloseStopGainOK = callAPI.tradeClose(sideClose, stopPriceStopGain, quantity, "TAKE_PROFIT")
+            if tradeCloseStopGainOK:
+                print("Stop Gain placed at {}".format(stopPriceStopGain))
         else:
-            TradeOrder(direction)
-            if direction == "BUY":
-                print("BUY!!!!!!!!!!!!!!!!!!")
-            elif direction == "SELL":
-                print("SELL!!!!!!!!!!!!!!!!!!")
+            tradeMessage = "Cannot place trade!"
 
-#####################################################################################################
+    else:
+        tradeMessage = "Position existed, no new trade."
+    
+    return tradeMessage
 
-ws = websocket.WebSocketApp(SOCKET, on_open = on_open, on_close = on_close, on_message = on_message)
-ws.run_forever()
+if __name__ == "__main__":
+
+    closes = []
+    bbRanges = []
+    bbRangePercentsRaw = []
+    bbRangePercents = []
+    bbPercents = []
+
+    def on_open(ws):
+        print('opened connection')
+
+    def on_close(ws):
+        print('closed connection')
+
+    def on_message(ws, message):
+
+        global closes, bbRanges, bbRangePercentsRaw, bbRangePercents, bbPercents
+
+        close, is_candle_closed = getClose(message)
+
+        if is_candle_closed:
+            
+            closes.append(float(close))
+            
+            upper, middle, lower, bbRanges, bbRangePercents, bbPercents = calculateBollingerBandData(closes, ROLLING_PERIODS, NUMBER_SD)
+            
+            GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents)
+            
+            direction = generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents)
+            
+            if direction not in ["BUY", "SELL"]:
+                print("No signal yet...")
+            else:
+                print("{} order triggered!!!".format(direction))
+                tradeMessage = TradeOrder(direction)
+                print(tradeMessage)
+
+    ws = websocket.WebSocketApp(SOCKET, on_open = on_open, on_close = on_close, on_message = on_message)
+    ws.run_forever()
