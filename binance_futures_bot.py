@@ -1,3 +1,26 @@
+# new updates:
+# 1. add test mode for selected parameters (real => test)                                           * DONE
+# AUM_PERCENTAGE_STOP_GAIN
+#       0.125 => 0.01
+# AUM_PERCENTAGE_CUT_LOSS
+#       0.1 => 0.01
+# quantity (inside Function TradeOrder) 
+#       round(balance * leverage / tradePrice * (1 - ORDER_BUFFER), 1) => 10
+# is_candle_closed
+#       is_candle_closed => True
+# direction 
+#       generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents) => "BUY"
+#
+# 2. auto adjust optimal leverage level by current bbRange and markeet depth                        * DONE
+# leverage = f(bbRange, market depth)
+#
+# 3. auto send email/sms with trade details to myself in case of open/close trades
+#
+# 4. update trade record database for every open/close trade                                        * DONE
+#
+# 5. improve codes in open new order when AUM grow bigger,
+#    considering the market impct of big trade order
+
 import config, csv, hashlib, hmac, json, numpy, requests, talib, time, websocket
 from binance.client import Client
 from binance.enums import *
@@ -206,6 +229,8 @@ def TradeOrder(sideOpen, bbRanges, mode):
         elif (mode == "TEST"):
             quantity = 10
         tradeOpenOK = callAPI.tradeOpen(sideOpen, quantity)
+        print('tradeOpenOK, sideOpen, quantity, balance, leverage, tradePrice')
+        print(tradeOpenOK, sideOpen, quantity, balance, leverage, tradePrice)
         if tradeOpenOK:
             tradeMessage = "{} order is placed! Quantity: {} Cost: {}".format(sideOpen, quantity, tradePrice)
             tradeCloseCutLossOK = callAPI.tradeClose(sideClose, stopPriceCutLoss, quantity, "STOP")
@@ -245,13 +270,16 @@ def calcuateNewLeverage(balance, bbRanges):
         floor = int(item['notionalFloor'])
         if (newBalance < cap) & (newBalance > floor):
             maxLeverage = int(item['initialLeverage'])
+    print("maxLeverage = {}".format(maxLeverage))
     # find implied leverage given bbRange
     curPrice = float(callAPI.getPosition()['markPrice'])
     moveRangePercent = float(bbRanges[-1] / (2 * curPrice))
     impliedLeverage =  int(AUM_PERCENTAGE_STOP_GAIN / moveRangePercent)
+    print("impliedLeverage = {}".format(impliedLeverage))
     # compare 2 leverage values and return better one
     # final adjusted leverage must be within (2, max)
     adjustedLeverage = max(2, min(maxLeverage, impliedLeverage))
+    print("adjustedLeverage = {}".format(adjustedLeverage))
     callAPI.changeLeverage(adjustedLeverage)
     return adjustedLeverage
 
