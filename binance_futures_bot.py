@@ -26,14 +26,14 @@ from binance.client import Client
 from binance.enums import *
 
 ## Constants
-TRADE_SYMBOL = "XRPUSDT"
+TRADE_SYMBOL = "DOGEUSDT"
 MODE = "REAL"                       # ["REAL", "TEST"]
 ROLLING_PERIODS = 20
 NUMBER_SD = 2
 BB_RANGE_PERCENTILE = 95
 AUM_TARGET_USD = 12800000
 TRADE_LEVERAGE = 5
-ORDER_BUFFER = 0.01
+ORDER_BUFFER = 0.02
 
 if (MODE == "REAL"):
     AUM_PERCENTAGE_STOP_GAIN = 0.125    # expected gain as a % of AUM after a win trade
@@ -87,12 +87,12 @@ class CallAPI:
         p = {'recvWindow': self.RecvWindow, 'symbol': self.symbol, 'side': direction, 'type': 'MARKET', 'quantity': quantity, 'timestamp': self.timestamp}
         p['signature'] = self.__hashing(self.__param2string(p))
         response = requests.post(url = self.__base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': self.__key}, data = p)
-        return (response.status_code == 200)
+        return (response.status_code)
     def tradeClose(self, direction, price, quantity, type):
         p = {'recvWindow': self.RecvWindow, 'symbol': self.symbol, 'side': direction, 'type': type, 'quantity': quantity, 'price': price, 'stopPrice': price, 'timeInForce': "GTC", 'reduceOnly': True, 'timestamp': self.timestamp}
         p['signature'] = self.__hashing(self.__param2string(p))
         response = requests.post(url = self.__base_url_futures + '/fapi/v1/order', headers = {'X-MBX-APIKEY': self.__key}, data = p)
-        return (response.status_code == 200)
+        return (response.status_code)
     ############################################################################################################
     def getOpenOrder(self):
         p = {'recvWindow': self.RecvWindow, 'symbol': self.symbol, 'timestamp': self.timestamp}
@@ -175,7 +175,7 @@ def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents,
         # 2. last bbRange >= $0.01
         # 3. No holding in TRADE_SYMBOL
         logicAll1 = True #(bbRangePercents[-1] <= numpy.percentile(bbRangePercents, BB_RANGE_PERCENTILE))
-        logicAll2 = (bbRanges[-1] >= 0.01)
+        logicAll2 = True #(bbRanges[-1] >= 0.01)
         logicAll3 = float(callAPI.getPosition()['positionAmt']) == 0
         logicAll = logicAll1 & logicAll2 & logicAll3
         ### LONG logic
@@ -202,7 +202,7 @@ def generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents,
             direction = "NO SIGNAL"
     return direction
 
-def TradeOrder(sideOpen, bbRanges, mode):
+def TradeOrder(sideOpen, bbRanges, last_trade_status, mode):
     callAPI = CallAPI()
     # check current quantity held, cash balance and current leverage
     quantityTradeSymbol = float(callAPI.getPosition()['positionAmt'])
@@ -225,27 +225,31 @@ def TradeOrder(sideOpen, bbRanges, mode):
         if (openOrder > 0):
             callAPI.killAllOrder()
         if (mode == "REAL"):
-            quantity = round(balance * leverage / tradePrice * (1 - ORDER_BUFFER), 1)
+            quantity = int(balance * leverage / tradePrice * (1 - ORDER_BUFFER))
         elif (mode == "TEST"):
             quantity = 10
         tradeOpenOK = callAPI.tradeOpen(sideOpen, quantity)
-        print('tradeOpenOK, sideOpen, quantity, balance, leverage, tradePrice')
-        print(tradeOpenOK, sideOpen, quantity, balance, leverage, tradePrice)
-        if tradeOpenOK:
+        while (tradeOpenOK != 200):
+            quantity -= 1
+            tradeOpenOK = callAPI.tradeOpen(sideOpen, quantity)
+            print('tradeOpenOK, sideOpen, quantity, balance, leverage, tradePrice')
+            print(tradeOpenOK, sideOpen, quantity, balance, leverage, tradePrice)
+        if tradeOpenOK == 200:
             tradeMessage = "{} order is placed! Quantity: {} Cost: {}".format(sideOpen, quantity, tradePrice)
             tradeCloseCutLossOK = callAPI.tradeClose(sideClose, stopPriceCutLoss, quantity, "STOP")
-            if tradeCloseCutLossOK:
+            if tradeCloseCutLossOK == 200:
                 print("Cut Loss placed at {}".format(stopPriceCutLoss))
             tradeCloseStopGainOK = callAPI.tradeClose(sideClose, stopPriceStopGain, quantity, "TAKE_PROFIT")
-            if tradeCloseStopGainOK:
+            if tradeCloseStopGainOK == 200:
                 print("Stop Gain placed at {}".format(stopPriceStopGain))
             tradeInfo = {'tradeTime': callAPI.timestamp, 'tradeDirection': sideOpen, 'tradeQuantity': callAPI.getPosition()['positionAmt'], 'tradePrice': callAPI.getPosition()['entryPrice'], 'priceCutLoss': stopPriceCutLoss, 'priceStopGain': stopPriceStopGain, 'balance': balance,'leverage': leverage}
             TradeLog(tradeInfo)
+            last_trade_status = sideOpen
         else:
             tradeMessage = "Cannot place trade!"
     else:
         tradeMessage = "Position existed, no new trade."
-    return tradeMessage
+    return tradeMessage, last_trade_status
 
 # update the trade history once trade triggered
 def TradeLog(tradeInfo):
@@ -290,6 +294,7 @@ if __name__ == "__main__":
     bbRangePercentsRaw = []
     bbRangePercents = []
     bbPercents = []
+    last_trade_status = "NEW"
 
     def on_open(ws):
         print('opened connection')
@@ -299,7 +304,7 @@ if __name__ == "__main__":
 
     def on_message(ws, message):
 
-        global closes, bbRanges, bbRangePercentsRaw, bbRangePercents, bbPercents
+        global closes, bbRanges, bbRangePercentsRaw, bbRangePercents, bbPercents, last_trade_status
 
         close, is_candle_closed = getClose(message, MODE)
 
@@ -312,13 +317,16 @@ if __name__ == "__main__":
             GeneratePortfolioSnapshot(bbRanges, bbPercents, bbRangePercents)
             
             direction = generateTradeSignal(closes, upper, middle, lower, bbRanges, bbRangePercents, MODE)
-            
-            if direction not in ["BUY", "SELL"]:
-                print("No signal yet...")
-            else:
-                print("{} order triggered!!!".format(direction))
-                tradeMessage = TradeOrder(direction, bbRanges, MODE)
-                print(tradeMessage)
+
+            if (last_trade_status == direction):
+                print("No trade of same side as last trade is allowed.") 
+            else:           
+                if direction not in ["BUY", "SELL"]:
+                    print("No signal yet...")
+                else:
+                    print("{} order triggered!!!".format(direction))
+                    tradeMessage, last_trade_status = TradeOrder(direction, bbRanges, last_trade_status, MODE)
+                    print(tradeMessage)
 
     ws = websocket.WebSocketApp(SOCKET, on_open = on_open, on_close = on_close, on_message = on_message)
     ws.run_forever()
